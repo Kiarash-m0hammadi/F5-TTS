@@ -258,7 +258,7 @@ class Trainer:
         gc.collect()
         return update
 
-    def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
+    def train(self, train_dataset: Dataset, num_workers=0, resumable_with_seed: int = None):
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -281,7 +281,7 @@ class Trainer:
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=(num_workers > 0),
                 batch_size=self.batch_size_per_gpu,
                 shuffle=True,
                 generator=generator,
@@ -301,7 +301,7 @@ class Trainer:
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=(num_workers > 0),
                 batch_sampler=batch_sampler,
             )
         else:
