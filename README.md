@@ -91,7 +91,7 @@ conda activate f5-tts
 > ```bash
 > git clone https://github.com/SWivid/F5-TTS.git
 > cd F5-TTS
-> # git submodule update --init --recursive  # (optional, if need > bigvgan)
+> # git submodule update --init --recursive  # (optional, if use bigvgan as vocoder)
 > pip install -e .
 > ```
 
@@ -112,7 +112,7 @@ docker container run --rm -it --gpus=all --mount 'type=volume,source=f5-tts,targ
 Deployment solution with Triton and TensorRT-LLM.
 
 #### Benchmark Results
-Decoding on a single L20 GPU, using 26 different prompt_audio & target_text pairs.
+Decoding on a single L20 GPU, using 26 different prompt_audio & target_text pairs, 16 NFE.
 
 | Model               | Concurrency    | Avg Latency | RTF    | Mode            |
 |---------------------|----------------|-------------|--------|-----------------|
