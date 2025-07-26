@@ -32,9 +32,26 @@ from typing import Optional, Tuple, List, Dict, Any
 
 import torch
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
+from omegaconf import OmegaConf
+from hydra.utils import get_class
+from importlib.resources import files
+import queue
+import threading
+import torchaudio
+import wave
+
+from f5_tts.infer.utils_infer import (
+    chunk_text,
+    infer_batch_process,
+    load_model,
+    load_vocoder,
+    preprocess_ref_audio_text,
+)
+
 
 ### NEW/MODIFIED ###: Import the number-to-word conversion library
 logger.info(f"sys.path before num2fawords import: {sys.path}")
@@ -55,7 +72,151 @@ from f5_tts.config import settings # Changed back to absolute import
 # --- Global State (Reverted from AppState/app.state) ---
 tts_api: Optional[F5TTS] = None
 preselected_voices: List[Dict[str, Any]] = [] # Renamed from PRESELECTED_VOICES for consistency
-inference_lock = asyncio.Lock() # Add a lock for thread-safe inference
+streaming_processor: Optional["TTSStreamingProcessor"] = None
+# CRITICAL CHANGE: Use a threading.Lock for multi-thread safety
+inference_lock = threading.Lock()
+
+
+# --- Streaming Classes (from socket_server.py) ---
+
+class AudioFileWriterThread(threading.Thread):
+    """Threaded file writer to avoid blocking the TTS streaming process."""
+
+    def __init__(self, output_file, sampling_rate):
+        super().__init__()
+        self.output_file = output_file
+        self.sampling_rate = sampling_rate
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.audio_data = []
+
+    def run(self):
+        """Process queued audio data and write it to a file."""
+        logger.info("AudioFileWriterThread started.")
+        with wave.open(self.output_file, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sampling_rate)
+
+            while not self.stop_event.is_set() or not self.queue.empty():
+                try:
+                    chunk = self.queue.get(timeout=0.1)
+                    if chunk is not None:
+                        chunk = np.int16(chunk * 32767)
+                        self.audio_data.append(chunk)
+                        wf.writeframes(chunk.tobytes())
+                except queue.Empty:
+                    continue
+
+    def add_chunk(self, chunk):
+        """Add a new chunk to the queue."""
+        self.queue.put(chunk)
+
+    def stop(self):
+        """Stop writing and ensure all queued data is written."""
+        self.stop_event.set()
+        self.join()
+        logger.info("Audio writing completed.")
+
+
+class TTSStreamingProcessor:
+    def __init__(self, model, ckpt_file, vocab_file, ref_audio, ref_text, device=None, dtype=torch.float32):
+        self.device = device or (
+            "cuda"
+            if torch.cuda.is_available()
+            else "xpu"
+            if torch.xpu.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
+        model_cfg = OmegaConf.load(str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
+        self.model_cls = get_class(f"f5_tts.model.{model_cfg.model.backbone}")
+        self.model_arc = model_cfg.model.arch
+        self.mel_spec_type = model_cfg.model.mel_spec.mel_spec_type
+        self.sampling_rate = model_cfg.model.mel_spec.target_sample_rate
+
+        self.model = self.load_ema_model(ckpt_file, vocab_file, dtype)
+        self.vocoder = self.load_vocoder_model()
+
+        self.update_reference(ref_audio, ref_text)
+        self._warm_up()
+        self.file_writer_thread = None
+        self.first_package = True
+
+    def load_ema_model(self, ckpt_file, vocab_file, dtype):
+        return load_model(
+            self.model_cls,
+            self.model_arc,
+            ckpt_path=ckpt_file,
+            mel_spec_type=self.mel_spec_type,
+            vocab_file=vocab_file,
+            ode_method="euler",
+            use_ema=True,
+            device=self.device,
+        ).to(self.device, dtype=dtype)
+
+    def load_vocoder_model(self):
+        return load_vocoder(vocoder_name=self.mel_spec_type, is_local=False, local_path=None, device=self.device)
+
+    def update_reference(self, ref_audio, ref_text):
+        self.ref_audio, self.ref_text = preprocess_ref_audio_text(ref_audio, ref_text)
+        self.audio, self.sr = torchaudio.load(self.ref_audio)
+
+        ref_audio_duration = self.audio.shape[-1] / self.sr
+        ref_text_byte_len = len(self.ref_text.encode("utf-8"))
+        self.max_chars = int(ref_text_byte_len / (ref_audio_duration) * (25 - ref_audio_duration))
+        self.few_chars = int(ref_text_byte_len / (ref_audio_duration) * (25 - ref_audio_duration) / 2)
+        self.min_chars = int(ref_text_byte_len / (ref_audio_duration) * (25 - ref_audio_duration) / 4)
+
+    def _warm_up(self):
+        logger.info("Warming up the model...")
+        gen_text = "Warm-up text for the model."
+        for _ in infer_batch_process(
+            (self.audio, self.sr),
+            self.ref_text,
+            [gen_text],
+            self.model,
+            self.vocoder,
+            progress=None,
+            device=self.device,
+            streaming=True,
+        ):
+            pass
+        logger.info("Warm-up completed.")
+
+    def generate_stream(self, text: str):
+        """
+        A generator that yields audio chunks as bytes.
+        This version is decoupled from the network layer.
+        """
+        # --- Text chunking logic is the same ---
+        text_batches = chunk_text(text, max_chars=self.max_chars)
+        if self.first_package:
+            text_batches = chunk_text(text_batches[0], max_chars=self.few_chars) + text_batches[1:]
+            text_batches = chunk_text(text_batches[0], max_chars=self.min_chars) + text_batches[1:]
+            self.first_package = False # Note: You'll need to manage this state per-request
+
+        audio_stream = infer_batch_process(
+            (self.audio, self.sr),
+            self.ref_text,
+            text_batches,
+            self.model,
+            self.vocoder,
+            progress=None,
+            device=self.device,
+            streaming=True,
+            chunk_size=2048, # Or another suitable chunk size
+        )
+
+        logger.info("Starting to yield audio chunks from generator.")
+        for audio_chunk, _ in audio_stream:
+            if len(audio_chunk) > 0:
+                # Convert numpy float array to 16-bit PCM bytes
+                chunk_bytes = np.int16(audio_chunk * 32767).tobytes()
+                yield chunk_bytes
+        
+        logger.info("Finished yielding audio chunks.")
 
 # --- Helper Functions ---
 
@@ -275,12 +436,42 @@ def _run_startup_test(model: F5TTS):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
-    global tts_api # Using global tts_api
+    global tts_api, streaming_processor # Using global tts_api
     if _perform_startup_checks():
         _load_preset_voices()
         tts_api = _initialize_tts_model()
         if tts_api:
             _run_startup_test(tts_api)
+            # --- Initialize the streaming processor ---
+            try:
+                logger.info("--- Initializing TTSStreamingProcessor ---")
+                # Use a preset voice for initialization if available
+                if preselected_voices:
+                    ref_audio_path = preselected_voices[0]["audio_path"]
+                    ref_text = preselected_voices[0]["text"]
+                    logger.info(f"Using preset '{preselected_voices[0]['id']}' for streaming processor.")
+                else:
+                    # Fallback to a random reference if no presets
+                    ref_audio_path, ref_text = _get_random_reference()
+                    logger.info("Using random reference for streaming processor.")
+
+                if ref_audio_path and ref_text:
+                    streaming_processor = TTSStreamingProcessor(
+                        model=settings.EXP_NAME,
+                        ckpt_file=str(settings.CHECKPOINT_FILE),
+                        vocab_file=str(settings.vocab_path),
+                        ref_audio=ref_audio_path,
+                        ref_text=ref_text,
+                        device=settings.DEVICE
+                    )
+                    logger.info("✅ [OK] TTSStreamingProcessor initialized successfully.")
+                else:
+                    logger.error("❌ [FAIL] Could not find a reference audio/text to initialize TTSStreamingProcessor.")
+                    streaming_processor = None
+
+            except Exception as e:
+                logger.critical(f"❌ [FATAL] Failed to initialize TTSStreamingProcessor: {e}", exc_info=True)
+                streaming_processor = None
     else:
         logger.critical("Critical startup checks failed. TTS service will be unavailable.")
     
@@ -495,6 +686,68 @@ async def ai_tts(
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(status_code=500, detail=f"An internal error occurred during /AI_TTS synthesis: {str(e)}")
+
+
+@app.post("/synthesize_stream/")
+async def synthesize_speech_stream(
+    gen_text: str = Form(..., description="Text to synthesize."),
+):
+    if streaming_processor is None:
+        raise HTTPException(status_code=503, detail="Streaming TTS service is not available.")
+
+    async def stream_generator(queue: asyncio.Queue):
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield chunk
+            await asyncio.sleep(0.001)
+
+    # This blocking function runs in a separate thread
+    def run_tts_and_fill_queue(text: str, queue: asyncio.Queue):
+        # CRITICAL CHANGE: Acquire the threading.Lock here
+        with inference_lock:
+            logger.info("Inference lock acquired for streaming request in thread.")
+            try:
+                streaming_processor.first_package = True
+                
+                processed_text = convert_numbers_to_persian_words(text)
+                padded_text = _pad_short_text(processed_text)
+                
+                audio_generator = streaming_processor.generate_stream(padded_text)
+                for chunk in audio_generator:
+                    # Use asyncio's thread-safe call to put items in the queue
+                    asyncio.run_coroutine_threadsafe(queue.put(chunk), asyncio.get_running_loop())
+            except Exception as e:
+                logger.error(f"Error in TTS thread: {e}", exc_info=True)
+            finally:
+                # IMPORTANT: Put the sentinel value to signal the end
+                asyncio.run_coroutine_threadsafe(queue.put(None), asyncio.get_running_loop())
+                logger.info("Inference lock released for streaming request in thread.")
+
+
+    # --- Main Endpoint Logic ---
+    try:
+        q = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        
+        # Run the blocking function in the default thread pool executor
+        # CRITICAL CHANGE: The lock is no longer managed here
+        loop.run_in_executor(
+            None,
+            run_tts_and_fill_queue,
+            gen_text,
+            q
+        )
+        
+        # Return the streaming response that reads from the queue
+        # Minor refinement: Changed media_type for clarity
+        return StreamingResponse(stream_generator(q), media_type="audio/raw")
+
+    except Exception as e:
+        logger.error(f"Error setting up streaming response: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to start audio stream.")
+
 
 if __name__ == "__main__":
     logger.info("Starting FastAPI TTS server...")
