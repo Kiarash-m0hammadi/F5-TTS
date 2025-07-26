@@ -4,6 +4,7 @@ from importlib.resources import files
 import torch
 import torch.nn.functional as F
 import torchaudio
+import torchaudio.functional as F_audio
 from datasets import Dataset as Dataset_
 from datasets import load_from_disk
 from torch import nn
@@ -149,8 +150,7 @@ class CustomDataset(Dataset):
 
             # resample if necessary
             if source_sample_rate != self.target_sample_rate:
-                resampler = torchaudio.transforms.Resample(source_sample_rate, self.target_sample_rate)
-                audio = resampler(audio)
+                audio = F_audio.resample(audio, orig_freq=source_sample_rate, new_freq=self.target_sample_rate)
 
             # to mel spectrogram
             mel_spec = self.mel_spectrogram(audio)

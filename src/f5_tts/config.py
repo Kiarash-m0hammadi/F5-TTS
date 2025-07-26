@@ -6,10 +6,10 @@ class Settings(BaseSettings):
     """Holds all configuration for the application, loaded from environment variables or a .env file."""
     
     # --- Core Paths & Model Config ---
-    PROJECT_NAME: str = "F5_Mana_char"
+    PROJECT_NAME: str = "Fa2_char"
     EXP_NAME: str = "F5TTS_v1_Base"
     DATA_PATH: Path = Path("data")
-    CHECKPOINT_FILE: Path
+    CHECKPOINT_FILE: Path = Path("D:/projects/F5-tts/F5-TTS/ckpts/Fa2/model_last.pt")
 
     # --- Default TTS Parameters ---
     NFE_STEP: int = 32
@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # --- Server Config ---
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = 8025
     CORS_ORIGINS: List[str] = ["*"]
 
     @property
@@ -43,7 +43,7 @@ class Settings(BaseSettings):
         return self.DATA_PATH / self.PROJECT_NAME / "wavs"
 
     class Config:
-        env_file = ".env"
+        env_file = str(Path(__file__).parent.parent.parent.parent / ".env")
         env_file_encoding = 'utf-8'
         extra = "ignore"
 

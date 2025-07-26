@@ -1,4 +1,16 @@
+# DEBUG: Log config paths at startup
+import os
+import logging
 import sys # Required for sys.path manipulation
+# --- Setup Logging ---
+# Placed logging config once at the top for clarity
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+logging.info(f"DEBUG: Current working directory: {os.getcwd()}")
+from f5_tts.config import settings
+logging.info(f"DEBUG: DATA_PATH resolved to: {settings.DATA_PATH} (type: {type(settings.DATA_PATH)})")
+logging.info(f"DEBUG: vocab_path resolved to: {settings.vocab_path} (type: {type(settings.vocab_path)})")
 from pathlib import Path # Ensure Path is imported early for sys.path
 
 # This block ensures that the 'src' directory (parent of 'f5_tts' package)
@@ -13,9 +25,9 @@ import shutil
 import tempfile
 import random
 import csv
-import logging
-# from pathlib import Path # Already imported above
+import re ### NEW/MODIFIED ###: Import regular expressions for number finding
 from contextlib import asynccontextmanager
+import asyncio # Add asyncio for locking
 from typing import Optional, Tuple, List, Dict, Any
 
 import torch
@@ -24,18 +36,62 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
 
+### NEW/MODIFIED ###: Import the number-to-word conversion library
+logger.info(f"sys.path before num2fawords import: {sys.path}")
+# You must install this library first: pip install num2fawords
+try:
+    from num2fawords import words as num2fawords
+    num2fawords_available = True
+    logger.info("Successfully imported num2fawords library (words function).")
+except ImportError:
+    num2fawords_available = False
+    logger.warning("Could not import 'num2fawords'. Number-to-word conversion will be disabled.")
+    logger.warning("Please install it using: pip install num2fawords")
+
+
 from f5_tts.api import F5TTS
 from f5_tts.config import settings # Changed back to absolute import
-
-# --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
 
 # --- Global State (Reverted from AppState/app.state) ---
 tts_api: Optional[F5TTS] = None
 preselected_voices: List[Dict[str, Any]] = [] # Renamed from PRESELECTED_VOICES for consistency
+inference_lock = asyncio.Lock() # Add a lock for thread-safe inference
 
 # --- Helper Functions ---
+
+### NEW/MODIFIED ###: Start of new functions for number conversion
+def _replace_number_with_words(match: "re.Match[str]") -> str:
+    """
+    Takes a regex match object, converts the number to an integer
+    (handling Persian and Arabic numerals), and returns the word form.
+    """
+    number_str = match.group(0)
+    # Translation table for Persian/Arabic numerals to Western numerals
+    persian_to_english_map = str.maketrans('۰۱۲۳۴۵۶۷۸۹', '0123456789')
+    english_num_str = number_str.translate(persian_to_english_map)
+
+    try:
+        number_int = int(english_num_str)
+        # Convert the integer to Persian words using the imported library
+        return num2fawords(number_int)
+    except (ValueError, NameError): # NameError if num2fawords is not imported
+        # If conversion fails, return the original number string
+        return number_str
+
+def convert_numbers_to_persian_words(text: str) -> str:
+    """
+    Finds all numbers in a string and converts them to their Persian
+    written equivalent. Handles both '8' and '۸'.
+    Example: "قیمت 35 هزار تومان است" -> "قیمت سی و پنج هزار تومان است"
+    """
+    if not num2fawords_available:
+        logger.warning("Skipping number-to-word conversion because 'num2fawords' is not available.")
+        return text
+
+    # Regex to find sequences of Western or Persian/Arabic digits
+    number_pattern = re.compile(r'[\d۰-۹]+')
+    return number_pattern.sub(_replace_number_with_words, text)
+### NEW/MODIFIED ###: End of new functions for number conversion
 
 def _cleanup_temp_file(path: str):
     """Safely remove a temporary file."""
@@ -279,6 +335,11 @@ async def synthesize_speech(
     temp_upload_path: Optional[str] = None
 
     try:
+        ### NEW/MODIFIED ###: Convert numbers in the input text to Persian words
+        logger.info(f"Original text received: '{gen_text}'")
+        processed_gen_text = convert_numbers_to_persian_words(gen_text)
+        logger.info(f"Text after number conversion: '{processed_gen_text}'")
+
         # --- Determine Reference Audio and Text (Inlined and simplified) ---
         if reference_mode == "upload":
             if ref_audio_file:
@@ -295,6 +356,20 @@ async def synthesize_speech(
                 ref_text_internal = ref_text
             # If no file, proceed zero-shot (ref_audio_path_str remains None)
         
+        elif reference_mode == "record":
+            if ref_audio_file:
+                if not ref_text:
+                    raise HTTPException(status_code=400, detail="Reference text is required for recorded reference audio.")
+                # Accept any audio type from the recorder, but log if not WAV
+                if ref_audio_file.content_type not in ["audio/wav", "audio/x-wav"]:
+                    logger.warning(f"Recorded file content type '{ref_audio_file.content_type}' is not standard WAV. Proceeding, but may cause issues.")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_upload:
+                    shutil.copyfileobj(ref_audio_file.file, tmp_upload)
+                    temp_upload_path = tmp_upload.name
+                ref_audio_path_str = temp_upload_path
+                ref_text_internal = ref_text
+            # If no file, proceed zero-shot (ref_audio_path_str remains None)
+
         elif reference_mode == "preset":
             if not preset_reference_id:
                 raise HTTPException(status_code=400, detail="`preset_reference_id` is required for 'preset' mode.")
@@ -317,25 +392,31 @@ async def synthesize_speech(
 
 
         # --- Prepare for Inference ---
-        padded_gen_text = _pad_short_text(gen_text)
+        ### NEW/MODIFIED ###: Use the text that has had numbers converted
+        padded_gen_text = _pad_short_text(processed_gen_text)
         current_seed = None if seed == -1 else seed
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
             output_temp_file = tmp_out.name
 
-        logger.info(f"Synthesizing speech with reference_mode='{reference_mode}'")
-        tts_api.infer(
-            ref_file=ref_audio_path_str,
-            ref_text=ref_text_internal.lower().strip() if ref_text_internal else None,
-            gen_text=padded_gen_text.lower().strip(),
-            nfe_step=nfe_step,
-            speed=speed,
-            remove_silence=remove_silence,
-            file_wave=output_temp_file,
-            seed=current_seed,
-        )
+        logger.info(f"Request to synthesize speech with reference_mode='{reference_mode}'. Acquiring lock...")
+        async with inference_lock:
+            logger.info("Inference lock acquired. Synthesizing...")
+            tts_api.infer(
+                ref_file=ref_audio_path_str,
+                ref_text=ref_text_internal.lower().strip() if ref_text_internal else None,
+                ### NEW/MODIFIED ###: Pass the fully processed text to the model
+                gen_text=padded_gen_text.lower().strip(),
+                nfe_step=nfe_step,
+                speed=speed,
+                remove_silence=remove_silence,
+                file_wave=output_temp_file,
+                seed=current_seed,
+            )
+            # The seed is only reliable right after inference, before the lock is released.
+            logger.info(f"Synthesis complete. Seed used: {tts_api.seed}. Releasing lock.")
 
-        logger.info(f"Synthesis complete. Output: {output_temp_file}, Seed used: {tts_api.seed}")
+        logger.info(f"Request complete. Sending file: {output_temp_file}")
         return FileResponse(
             path=output_temp_file,
             media_type="audio/wav",
@@ -351,6 +432,69 @@ async def synthesize_speech(
     finally:
         if temp_upload_path:
             _cleanup_temp_file(temp_upload_path)
+
+
+@app.post("/AI_TTS")
+async def ai_tts(
+    gen_text: str = Form(..., description="Text to synthesize with a preset voice."),
+    nfe_step: int = Form(settings.NFE_STEP),
+    speed: float = Form(settings.SPEED),
+    seed: int = Form(settings.SEED),
+    remove_silence: bool = Form(settings.REMOVE_SILENCE),
+    preset_reference_id: str = Form("preset_8", description="ID of the preset reference to use.")
+):
+    """
+    Synthesizes speech using a specified preset voice and returns the audio file.
+    Accepts synthesis parameters to control the output.
+    """
+    if tts_api is None:
+        raise HTTPException(status_code=503, detail="TTS service is unavailable. Check server logs for initialization errors.")
+
+    preset = next((p for p in preselected_voices if p["id"] == preset_reference_id), None)
+
+    if not preset:
+        raise HTTPException(status_code=404, detail=f"Preset reference '{preset_reference_id}' not found.")
+
+    ref_audio_path_str = preset["audio_path"]
+    ref_text_internal = preset["text"]
+    
+    try:
+        logger.info(f"Original text received for /AI_TTS: '{gen_text}'")
+        processed_gen_text = convert_numbers_to_persian_words(gen_text)
+        logger.info(f"Text after number conversion: '{processed_gen_text}'")
+        padded_gen_text = _pad_short_text(processed_gen_text)
+        
+        current_seed = None if seed == -1 else seed
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
+            output_temp_file = tmp_out.name
+        
+        logger.info(f"Request for /AI_TTS with preset '{preset_reference_id}'. Acquiring lock...")
+        async with inference_lock:
+            logger.info("Inference lock acquired for /AI_TTS. Synthesizing...")
+            tts_api.infer(
+                ref_file=ref_audio_path_str,
+                ref_text=ref_text_internal.lower().strip() if ref_text_internal else None,
+                gen_text=padded_gen_text.lower().strip(),
+                nfe_step=nfe_step,
+                speed=speed,
+                remove_silence=remove_silence,
+                file_wave=output_temp_file,
+                seed=current_seed,
+            )
+            logger.info(f"Synthesis for /AI_TTS complete. Seed used: {tts_api.seed}. Releasing lock.")
+        logger.info(f"Request for /AI_TTS complete. Sending file: {output_temp_file}")
+        return FileResponse(
+            path=output_temp_file,
+            media_type="audio/wav",
+            filename="ai_tts_output.wav",
+            background=BackgroundTask(_cleanup_temp_file, output_temp_file)
+        )
+    except Exception as e:
+        logger.error(f"Error during /AI_TTS synthesis: {e}", exc_info=True)
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=f"An internal error occurred during /AI_TTS synthesis: {str(e)}")
 
 if __name__ == "__main__":
     logger.info("Starting FastAPI TTS server...")
