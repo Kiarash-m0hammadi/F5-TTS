@@ -25,9 +25,9 @@ import shutil
 import tempfile
 import random
 import csv
-import re ### NEW/MODIFIED ###: Import regular expressions for number finding
+import re
 from contextlib import asynccontextmanager
-import asyncio # Add asyncio for locking
+import asyncio
 from typing import Optional, Tuple, List, Dict, Any
 
 import torch
@@ -52,9 +52,6 @@ from f5_tts.infer.utils_infer import (
     preprocess_ref_audio_text,
 )
 
-
-### NEW/MODIFIED ###: Import the number-to-word conversion library
-logger.info(f"sys.path before num2fawords import: {sys.path}")
 # You must install this library first: pip install num2fawords
 try:
     from num2fawords import words as num2fawords
@@ -67,13 +64,12 @@ except ImportError:
 
 
 from f5_tts.api import F5TTS
-from f5_tts.config import settings # Changed back to absolute import
+from f5_tts.config import settings
 
-# --- Global State (Reverted from AppState/app.state) ---
+# --- Global State ---
 tts_api: Optional[F5TTS] = None
-preselected_voices: List[Dict[str, Any]] = [] # Renamed from PRESELECTED_VOICES for consistency
+preselected_voices: List[Dict[str, Any]] = []
 streaming_processor: Optional["TTSStreamingProcessor"] = None
-# CRITICAL CHANGE: Use a threading.Lock for multi-thread safety
 inference_lock = threading.Lock()
 
 
@@ -120,7 +116,7 @@ class AudioFileWriterThread(threading.Thread):
 
 
 class TTSStreamingProcessor:
-    def __init__(self, model, ckpt_file, vocab_file, ref_audio, ref_text, device=None, dtype=torch.float32):
+    def __init__(self, model, ckpt_file, vocab_file, ref_audio, ref_text, device=None, dtype=torch.float32, target_sr: int = 16000):
         self.device = device or (
             "cuda"
             if torch.cuda.is_available()
@@ -134,10 +130,32 @@ class TTSStreamingProcessor:
         self.model_cls = get_class(f"f5_tts.model.{model_cfg.model.backbone}")
         self.model_arc = model_cfg.model.arch
         self.mel_spec_type = model_cfg.model.mel_spec.mel_spec_type
-        self.sampling_rate = model_cfg.model.mel_spec.target_sample_rate
+
+        # The native sample rate of the model
+        self.native_sampling_rate = model_cfg.model.mel_spec.target_sample_rate
+        # The desired output sample rate
+        self.target_sampling_rate = target_sr
+
+        logger.info(f"TTS Model Native SR: {self.native_sampling_rate}, Target Output SR: {self.target_sampling_rate}")
 
         self.model = self.load_ema_model(ckpt_file, vocab_file, dtype)
         self.vocoder = self.load_vocoder_model()
+
+        # --- START: MODIFICATION FOR RESAMPLING ---
+        # Create the resampler instance only once for efficiency.
+        # This object is stateful and designed for streaming.
+        if self.native_sampling_rate != self.target_sampling_rate:
+            logger.info("Initializing audio resampler...")
+            self.resampler = torchaudio.transforms.Resample(
+                orig_freq=self.native_sampling_rate,
+                new_freq=self.target_sampling_rate,
+                resampling_method="kaiser_window",
+                dtype=torch.float32,
+            ).to(self.device)
+        else:
+            self.resampler = None
+            logger.info("Native and target sample rates are the same. No resampling needed.")
+        # --- END: MODIFICATION FOR RESAMPLING ---
 
         self.update_reference(ref_audio, ref_text)
         self._warm_up()
@@ -187,15 +205,13 @@ class TTSStreamingProcessor:
 
     def generate_stream(self, text: str):
         """
-        A generator that yields audio chunks as bytes.
-        This version is decoupled from the network layer.
+        A generator that yields resampled audio chunks as bytes.
         """
-        # --- Text chunking logic is the same ---
         text_batches = chunk_text(text, max_chars=self.max_chars)
         if self.first_package:
             text_batches = chunk_text(text_batches[0], max_chars=self.few_chars) + text_batches[1:]
             text_batches = chunk_text(text_batches[0], max_chars=self.min_chars) + text_batches[1:]
-            self.first_package = False # Note: You'll need to manage this state per-request
+            self.first_package = False
 
         audio_stream = infer_batch_process(
             (self.audio, self.sr),
@@ -206,59 +222,64 @@ class TTSStreamingProcessor:
             progress=None,
             device=self.device,
             streaming=True,
-            chunk_size=2048, # Or another suitable chunk size
+            chunk_size=2048, # This chunk size is for the vocoder, not the final output
         )
 
         logger.info("Starting to yield audio chunks from generator.")
-        for audio_chunk, _ in audio_stream:
-            if len(audio_chunk) > 0:
-                # Convert numpy float array to 16-bit PCM bytes
-                chunk_bytes = np.int16(audio_chunk * 32767).tobytes()
+        for audio_chunk_np, _ in audio_stream:
+            if len(audio_chunk_np) > 0:
+                # Convert numpy array to a torch tensor on the correct device
+                audio_chunk_tensor = torch.from_numpy(audio_chunk_np).to(self.device, dtype=torch.float32)
+
+                # --- START: RESAMPLING LOGIC ---
+                if self.resampler:
+                    # Resample the tensor
+                    resampled_chunk_tensor = self.resampler(audio_chunk_tensor)
+                else:
+                    # No resampling needed, use the original tensor
+                    resampled_chunk_tensor = audio_chunk_tensor
+                # --- END: RESAMPLING LOGIC ---
+
+                # Convert the final tensor (resampled or not) to int16 bytes
+                chunk_bytes = np.int16(resampled_chunk_tensor.cpu().numpy() * 32767).tobytes()
                 yield chunk_bytes
         
         logger.info("Finished yielding audio chunks.")
 
 # --- Helper Functions ---
 
-### NEW/MODIFIED ###: Start of new functions for number conversion
 def _replace_number_with_words(match: "re.Match[str]") -> str:
     """
     Takes a regex match object, converts the number to an integer
     (handling Persian and Arabic numerals), and returns the word form.
     """
     number_str = match.group(0)
-    # Translation table for Persian/Arabic numerals to Western numerals
     persian_to_english_map = str.maketrans('۰۱۲۳۴۵۶۷۸۹', '0123456789')
     english_num_str = number_str.translate(persian_to_english_map)
 
     try:
         number_int = int(english_num_str)
-        # Convert the integer to Persian words using the imported library
         return num2fawords(number_int)
-    except (ValueError, NameError): # NameError if num2fawords is not imported
-        # If conversion fails, return the original number string
+    except (ValueError, NameError):
         return number_str
 
 def convert_numbers_to_persian_words(text: str) -> str:
     """
     Finds all numbers in a string and converts them to their Persian
-    written equivalent. Handles both '8' and '۸'.
-    Example: "قیمت 35 هزار تومان است" -> "قیمت سی و پنج هزار تومان است"
+    written equivalent.
     """
     if not num2fawords_available:
         logger.warning("Skipping number-to-word conversion because 'num2fawords' is not available.")
         return text
 
-    # Regex to find sequences of Western or Persian/Arabic digits
     number_pattern = re.compile(r'[\d۰-۹]+')
     return number_pattern.sub(_replace_number_with_words, text)
-### NEW/MODIFIED ###: End of new functions for number conversion
 
 def _cleanup_temp_file(path: str):
     """Safely remove a temporary file."""
     try:
         if path and Path(path).exists():
-            Path(path).unlink() # Using Path.unlink for consistency
+            Path(path).unlink()
             logger.info(f"Cleaned up temp file: {path}")
     except Exception as e:
         logger.error(f"Error cleaning up temp file {path}: {e}", exc_info=True)
@@ -307,7 +328,6 @@ def _pad_short_text(text: str) -> str:
 def _perform_startup_checks() -> bool:
     """Performs critical checks before attempting to load the model. Returns True if all checks pass."""
     logger.info("--- Running Startup Configuration Checks ---")
-    # Simplified check_map from an earlier version
     check_map = {
         "Checkpoint File": settings.CHECKPOINT_FILE,
         "Data Path": settings.DATA_PATH,
@@ -316,8 +336,8 @@ def _perform_startup_checks() -> bool:
     
     all_ok = True
     for name, path_obj in check_map.items():
-        path_to_check = Path(path_obj) # Ensure it's a Path object
-        is_file_check = "File" in name or "Vocab" in name # Heuristic for file vs dir
+        path_to_check = Path(path_obj)
+        is_file_check = "File" in name or "Vocab" in name
         
         if is_file_check:
             if path_to_check.is_file():
@@ -325,7 +345,7 @@ def _perform_startup_checks() -> bool:
             else:
                 logger.error(f"❌ [FAIL] {name} check failed for path: {path_to_check}")
                 all_ok = False
-        else: # Assumed to be a directory check
+        else:
             if path_to_check.is_dir():
                 logger.info(f"✅ [OK]   {name}: {path_to_check}")
             else:
@@ -346,7 +366,7 @@ def _perform_startup_checks() -> bool:
 def _load_preset_voices():
     """Loads a deterministic, evenly-spaced subset of voices from metadata."""
     global preselected_voices
-    preselected_voices = [] # Clear previous, if any
+    preselected_voices = []
     if not settings.metadata_path.is_file():
         logger.warning(f"Cannot load preset voices: metadata file not found at {settings.metadata_path}")
         return
@@ -375,10 +395,10 @@ def _load_preset_voices():
                 full_audio_path = settings.wavs_path / audio_filename
                 if full_audio_path.is_file():
                     preselected_voices.append({
-                        "id": f"preset_{i}", # Reverted ID format
-                        "name": Path(audio_filename).stem, # Keep stem as name for some user-friendliness
+                        "id": f"preset_{i}",
+                        "name": Path(audio_filename).stem,
                         "text": transcript,
-                        "audio_path": str(full_audio_path) # Internal path
+                        "audio_path": str(full_audio_path)
                     })
                 else:
                     logger.warning(f"Audio file for preset '{audio_filename}' not found. Skipping.")
@@ -408,7 +428,6 @@ def _initialize_tts_model() -> Optional[F5TTS]:
 def _run_startup_test(model: F5TTS):
     """Performs a quick synthesis to ensure the model is working."""
     logger.info("--- Performing Startup Test Synthesis ---")
-    # Using a fixed filename for the startup test output, as in earlier versions
     output_file_test = Path("startup_test_output.wav")
     ref_audio_path, ref_text = _get_random_reference()
     
@@ -419,7 +438,6 @@ def _run_startup_test(model: F5TTS):
         model.infer(
             ref_file=ref_audio_path,
             ref_text=ref_text.lower().strip() if ref_text else None,
-            # Using a generic test text, as STARTUP_TEST_TEXT might be removed from config
             gen_text="This is a startup test audio.",
             nfe_step=10, 
             speed=settings.SPEED,
@@ -436,7 +454,7 @@ def _run_startup_test(model: F5TTS):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
-    global tts_api, streaming_processor # Using global tts_api
+    global tts_api, streaming_processor
     if _perform_startup_checks():
         _load_preset_voices()
         tts_api = _initialize_tts_model()
@@ -445,24 +463,24 @@ async def lifespan(app: FastAPI):
             # --- Initialize the streaming processor ---
             try:
                 logger.info("--- Initializing TTSStreamingProcessor ---")
-                # Use a preset voice for initialization if available
                 if preselected_voices:
                     ref_audio_path = preselected_voices[0]["audio_path"]
                     ref_text = preselected_voices[0]["text"]
                     logger.info(f"Using preset '{preselected_voices[0]['id']}' for streaming processor.")
                 else:
-                    # Fallback to a random reference if no presets
                     ref_audio_path, ref_text = _get_random_reference()
                     logger.info("Using random reference for streaming processor.")
 
                 if ref_audio_path and ref_text:
+                    TARGET_SAMPLE_RATE = 16000
                     streaming_processor = TTSStreamingProcessor(
                         model=settings.EXP_NAME,
                         ckpt_file=str(settings.CHECKPOINT_FILE),
                         vocab_file=str(settings.vocab_path),
                         ref_audio=ref_audio_path,
                         ref_text=ref_text,
-                        device=settings.DEVICE
+                        device=settings.DEVICE,
+                        target_sr=TARGET_SAMPLE_RATE
                     )
                     logger.info("✅ [OK] TTSStreamingProcessor initialized successfully.")
                 else:
@@ -479,37 +497,35 @@ async def lifespan(app: FastAPI):
     yield
     # --- Shutdown ---
     logger.info("--- Application Shutting Down ---")
-    _cleanup_temp_file("startup_test_output.wav") # Cleanup fixed filename
+    _cleanup_temp_file("startup_test_output.wav")
 
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS, # Keep CORS from settings
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/health") # No response_model for simplicity in reverted version
+@app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    if tts_api is not None: # Direct check of global tts_api
+    if tts_api is not None:
         return {"status": "ok", "message": "TTS service is running."}
     else:
         raise HTTPException(status_code=503, detail="TTS service is not available.")
 
-@app.get("/list_preset_references") # No response_model
+@app.get("/list_preset_references")
 async def list_preset_references():
     """Lists available pre-selected reference voices."""
-    # Return only id, name, text as frontend likely expects this
     return [{"id": v["id"], "name": v["name"], "text": v["text"]} for v in preselected_voices]
 
 @app.post("/synthesize/")
 async def synthesize_speech(
-    # Reverted to individual Form parameters
     ref_audio_file: UploadFile = File(None, description="User-uploaded WAV file for reference."),
-    reference_mode: str = Form("upload", description="Mode for reference: 'upload', 'random', or 'preset'."),
+    reference_mode: str = Form("upload", description="Mode for reference: 'upload', 'random', 'preset', or 'zero_shot'."),
     preset_reference_id: Optional[str] = Form(None, description="ID of the preset reference (e.g., 'preset_0')."),
     ref_text: Optional[str] = Form(None, description="Transcript of the user-uploaded reference audio."),
     gen_text: str = Form(..., description="The text to be synthesized."),
@@ -518,7 +534,7 @@ async def synthesize_speech(
     seed: int = Form(settings.SEED),
     remove_silence: bool = Form(settings.REMOVE_SILENCE)
 ):
-    if tts_api is None: # Direct check of global tts_api
+    if tts_api is None:
         raise HTTPException(status_code=503, detail="TTS service is unavailable. Check server logs for initialization errors.")
 
     ref_audio_path_str: Optional[str] = None
@@ -526,41 +542,29 @@ async def synthesize_speech(
     temp_upload_path: Optional[str] = None
 
     try:
-        ### NEW/MODIFIED ###: Convert numbers in the input text to Persian words
         logger.info(f"Original text received: '{gen_text}'")
         processed_gen_text = convert_numbers_to_persian_words(gen_text)
         logger.info(f"Text after number conversion: '{processed_gen_text}'")
 
-        # --- Determine Reference Audio and Text (Inlined and simplified) ---
-        if reference_mode == "upload":
-            if ref_audio_file:
-                if not ref_text:
-                    raise HTTPException(status_code=400, detail="Reference text is required for uploaded reference audio.")
-                # Basic content type check (can be expanded if needed)
-                if ref_audio_file.content_type not in ["audio/wav", "audio/x-wav"]:
-                     logger.warning(f"Uploaded file content type '{ref_audio_file.content_type}' is not standard WAV. Proceeding, but may cause issues.")
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_upload:
-                    shutil.copyfileobj(ref_audio_file.file, tmp_upload)
-                    temp_upload_path = tmp_upload.name
-                ref_audio_path_str = temp_upload_path
-                ref_text_internal = ref_text
-            # If no file, proceed zero-shot (ref_audio_path_str remains None)
-        
-        elif reference_mode == "record":
-            if ref_audio_file:
-                if not ref_text:
-                    raise HTTPException(status_code=400, detail="Reference text is required for recorded reference audio.")
-                # Accept any audio type from the recorder, but log if not WAV
-                if ref_audio_file.content_type not in ["audio/wav", "audio/x-wav"]:
-                    logger.warning(f"Recorded file content type '{ref_audio_file.content_type}' is not standard WAV. Proceeding, but may cause issues.")
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_upload:
-                    shutil.copyfileobj(ref_audio_file.file, tmp_upload)
-                    temp_upload_path = tmp_upload.name
-                ref_audio_path_str = temp_upload_path
-                ref_text_internal = ref_text
-            # If no file, proceed zero-shot (ref_audio_path_str remains None)
+        # --- Determine Reference Audio and Text ---
+        if reference_mode in ["upload", "record"]:
+            ### START: FIX FOR TypeError ###
+            # If mode is 'upload' or 'record', the audio file and text are now mandatory.
+            if not ref_audio_file:
+                raise HTTPException(status_code=400, detail=f"Reference audio file is required for '{reference_mode}' mode.")
+            if not ref_text:
+                raise HTTPException(status_code=400, detail=f"Reference text is required for '{reference_mode}' mode.")
+            ### END: FIX FOR TypeError ###
 
+            if ref_audio_file.content_type not in ["audio/wav", "audio/x-wav", "audio/webm", "audio/webm;codecs=opus", "audio/ogg"]:
+                 logger.warning(f"Uploaded file content type '{ref_audio_file.content_type}' may not be standard WAV. Proceeding, but may cause issues.")
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_upload:
+                shutil.copyfileobj(ref_audio_file.file, tmp_upload)
+                temp_upload_path = tmp_upload.name
+            ref_audio_path_str = temp_upload_path
+            ref_text_internal = ref_text
+        
         elif reference_mode == "preset":
             if not preset_reference_id:
                 raise HTTPException(status_code=400, detail="`preset_reference_id` is required for 'preset' mode.")
@@ -575,15 +579,18 @@ async def synthesize_speech(
             ref_audio_path_str, ref_text_internal = _get_random_reference()
             if not ref_audio_path_str:
                 logger.warning("Random reference requested but none could be found. Proceeding zero-shot.")
+                # Explicitly set to None for zero-shot
+                ref_audio_path_str = None
+                ref_text_internal = None
         
-        # Implicit "zero_shot" if reference_mode is not upload/preset/random and no file is provided.
-        # Or if reference_mode is an unknown string.
-        elif reference_mode != "zero_shot": # If it's not an explicit zero_shot, but also not other known modes
-             logger.warning(f"Unknown reference_mode '{reference_mode}'. Proceeding as zero-shot if no reference audio is determined.")
+        elif reference_mode == "zero_shot":
+            ref_audio_path_str = None
+            ref_text_internal = None
 
+        else:
+             raise HTTPException(status_code=400, detail=f"Unknown reference_mode '{reference_mode}'.")
 
         # --- Prepare for Inference ---
-        ### NEW/MODIFIED ###: Use the text that has had numbers converted
         padded_gen_text = _pad_short_text(processed_gen_text)
         current_seed = None if seed == -1 else seed
         
@@ -591,12 +598,14 @@ async def synthesize_speech(
             output_temp_file = tmp_out.name
 
         logger.info(f"Request to synthesize speech with reference_mode='{reference_mode}'. Acquiring lock...")
-        async with inference_lock:
+        
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, inference_lock.acquire)
+        try:
             logger.info("Inference lock acquired. Synthesizing...")
             tts_api.infer(
                 ref_file=ref_audio_path_str,
                 ref_text=ref_text_internal.lower().strip() if ref_text_internal else None,
-                ### NEW/MODIFIED ###: Pass the fully processed text to the model
                 gen_text=padded_gen_text.lower().strip(),
                 nfe_step=nfe_step,
                 speed=speed,
@@ -604,8 +613,9 @@ async def synthesize_speech(
                 file_wave=output_temp_file,
                 seed=current_seed,
             )
-            # The seed is only reliable right after inference, before the lock is released.
             logger.info(f"Synthesis complete. Seed used: {tts_api.seed}. Releasing lock.")
+        finally:
+            inference_lock.release()
 
         logger.info(f"Request complete. Sending file: {output_temp_file}")
         return FileResponse(
@@ -634,10 +644,6 @@ async def ai_tts(
     remove_silence: bool = Form(settings.REMOVE_SILENCE),
     preset_reference_id: str = Form("preset_8", description="ID of the preset reference to use.")
 ):
-    """
-    Synthesizes speech using a specified preset voice and returns the audio file.
-    Accepts synthesis parameters to control the output.
-    """
     if tts_api is None:
         raise HTTPException(status_code=503, detail="TTS service is unavailable. Check server logs for initialization errors.")
 
@@ -661,7 +667,10 @@ async def ai_tts(
             output_temp_file = tmp_out.name
         
         logger.info(f"Request for /AI_TTS with preset '{preset_reference_id}'. Acquiring lock...")
-        async with inference_lock:
+        
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, inference_lock.acquire)
+        try:
             logger.info("Inference lock acquired for /AI_TTS. Synthesizing...")
             tts_api.infer(
                 ref_file=ref_audio_path_str,
@@ -674,6 +683,9 @@ async def ai_tts(
                 seed=current_seed,
             )
             logger.info(f"Synthesis for /AI_TTS complete. Seed used: {tts_api.seed}. Releasing lock.")
+        finally:
+            inference_lock.release()
+
         logger.info(f"Request for /AI_TTS complete. Sending file: {output_temp_file}")
         return FileResponse(
             path=output_temp_file,
@@ -703,9 +715,10 @@ async def synthesize_speech_stream(
             yield chunk
             await asyncio.sleep(0.001)
 
-    # This blocking function runs in a separate thread
-    def run_tts_and_fill_queue(text: str, queue: asyncio.Queue):
-        # CRITICAL CHANGE: Acquire the threading.Lock here
+    ### START: FIX FOR RuntimeError ###
+    # This blocking function runs in a separate thread. We must pass the
+    # event loop from the main thread to it.
+    def run_tts_and_fill_queue(text: str, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
         with inference_lock:
             logger.info("Inference lock acquired for streaming request in thread.")
             try:
@@ -716,32 +729,32 @@ async def synthesize_speech_stream(
                 
                 audio_generator = streaming_processor.generate_stream(padded_text)
                 for chunk in audio_generator:
-                    # Use asyncio's thread-safe call to put items in the queue
-                    asyncio.run_coroutine_threadsafe(queue.put(chunk), asyncio.get_running_loop())
+                    # Use the passed-in loop to call the thread-safe coroutine
+                    asyncio.run_coroutine_threadsafe(queue.put(chunk), loop)
             except Exception as e:
                 logger.error(f"Error in TTS thread: {e}", exc_info=True)
             finally:
                 # IMPORTANT: Put the sentinel value to signal the end
-                asyncio.run_coroutine_threadsafe(queue.put(None), asyncio.get_running_loop())
+                asyncio.run_coroutine_threadsafe(queue.put(None), loop)
                 logger.info("Inference lock released for streaming request in thread.")
-
+    ### END: FIX FOR RuntimeError ###
 
     # --- Main Endpoint Logic ---
     try:
         q = asyncio.Queue()
+        # Capture the current (main thread's) event loop
         loop = asyncio.get_running_loop()
         
-        # Run the blocking function in the default thread pool executor
-        # CRITICAL CHANGE: The lock is no longer managed here
+        # Run the blocking function in the default thread pool executor,
+        # passing the loop as an argument.
         loop.run_in_executor(
             None,
             run_tts_and_fill_queue,
             gen_text,
-            q
+            q,
+            loop # Pass the loop to the function
         )
         
-        # Return the streaming response that reads from the queue
-        # Minor refinement: Changed media_type for clarity
         return StreamingResponse(stream_generator(q), media_type="audio/raw")
 
     except Exception as e:
@@ -752,7 +765,6 @@ async def synthesize_speech_stream(
 if __name__ == "__main__":
     logger.info("Starting FastAPI TTS server...")
     try:
-        # Basic check for CHECKPOINT_FILE from settings
         if not settings.CHECKPOINT_FILE or not Path(settings.CHECKPOINT_FILE).is_file():
              raise FileNotFoundError(f"CHECKPOINT_FILE '{settings.CHECKPOINT_FILE}' not found or not configured.")
         
