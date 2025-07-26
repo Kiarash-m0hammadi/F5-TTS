@@ -463,10 +463,15 @@ async def lifespan(app: FastAPI):
             # --- Initialize the streaming processor ---
             try:
                 logger.info("--- Initializing TTSStreamingProcessor ---")
-                if preselected_voices:
+                preset8 = next((p for p in preselected_voices if p["id"] == "preset_7"), None)
+                if preset8:
+                    ref_audio_path = preset8["audio_path"]
+                    ref_text = preset8["text"]
+                    logger.info(f"Using preset 'preset_7' for streaming processor.")
+                elif preselected_voices:
                     ref_audio_path = preselected_voices[0]["audio_path"]
                     ref_text = preselected_voices[0]["text"]
-                    logger.info(f"Using preset '{preselected_voices[0]['id']}' for streaming processor.")
+                    logger.info(f"Using preset '{preselected_voices[0]['id']}' for streaming processor (fallback).")
                 else:
                     ref_audio_path, ref_text = _get_random_reference()
                     logger.info("Using random reference for streaming processor.")
@@ -642,7 +647,7 @@ async def ai_tts(
     speed: float = Form(settings.SPEED),
     seed: int = Form(settings.SEED),
     remove_silence: bool = Form(settings.REMOVE_SILENCE),
-    preset_reference_id: str = Form("preset_8", description="ID of the preset reference to use.")
+    preset_reference_id: str = Form("preset_7", description="ID of the preset reference to use.")
 ):
     if tts_api is None:
         raise HTTPException(status_code=503, detail="TTS service is unavailable. Check server logs for initialization errors.")
