@@ -16,6 +16,86 @@
 
 **Sway Sampling**: Inference-time flow step sampling strategy, greatly improves performance
 
+## Project Overview
+
+F5-TTS is a cutting-edge text-to-speech (TTS) model that leverages a Diffusion Transformer with ConvNeXt V2 to generate fluent and faithful speech. It is designed for fast training and inference, making it suitable for a wide range of applications. The project also includes an implementation of E2-TTS, a Flat-UNet Transformer, and introduces Sway Sampling, an inference-time flow step sampling strategy that significantly improves performance.
+
+## Architecture
+
+The core of F5-TTS is the Conditional Flow Matching (CFM) module, which is responsible for generating mel-spectrograms from text. The CFM module is built on top of a Transformer backbone, which can be either a DiT (Diffusion Transformer) or a UNetT (Flat-UNet Transformer). The model is conditioned on both text and a reference audio snippet, allowing it to generate speech in a variety of styles and voices.
+
+## API Usage
+
+The `F5TTS` class in `src/f5_tts/api.py` provides a simple interface for using the model. Here's a basic example:
+
+```python
+from f5_tts.api import F5TTS
+
+# Initialize the model
+f5tts = F5TTS()
+
+# Transcribe an audio file
+text = f5tts.transcribe("path/to/audio.wav")
+
+# Generate speech
+wav, sr, spec = f5tts.infer(
+    ref_file="path/to/reference_audio.wav",
+    ref_text=text,
+    gen_text="This is the text to be synthesized.",
+    file_wave="path/to/output.wav",
+    file_spec="path/to/output.png",
+)
+```
+
+## Training and Finetuning
+
+The `f5-tts_finetune-cli` script provides a command-line interface for training and finetuning the model. Here's an example of how to use it:
+
+```bash
+f5-tts_finetune-cli \
+    --exp_name F5TTS_v1_Base \
+    --dataset_name MyDataset \
+    --learning_rate 1e-5 \
+    --batch_size_per_gpu 3200 \
+    --epochs 100
+```
+
+Key arguments:
+
+*   `--exp_name`: The name of the experiment, which determines the model architecture and configuration.
+*   `--dataset_name`: The name of the dataset to use for training.
+*   `--learning_rate`: The learning rate for the optimizer.
+*   `--batch_size_per_gpu`: The batch size per GPU.
+*   `--epochs`: The number of training epochs.
+*   `--finetune`: A flag to indicate that you are finetuning a pretrained model.
+*   `--pretrain`: The path to the pretrained model checkpoint.
+
+## Directory Structure
+
+```
+.
+├── ckpts/                # Checkpoints
+├── data/                 # Datasets
+├── src/                  # Source code
+│   ├── f5_tts/
+│   │   ├── configs/      # Model configurations
+│   │   ├── eval/         # Evaluation scripts
+│   │   ├── infer/        # Inference scripts and utilities
+│   │   ├── model/        # Model architecture and components
+│   │   ├── runtime/      # Triton and TensorRT-LLM deployment
+│   │   ├── scripts/      # Miscellaneous scripts
+│   │   └── train/        # Training and finetuning scripts
+│   └── third_party/      # Third-party libraries
+├── .gitignore
+├── .gitmodules
+├── .pre-commit-config.yaml
+├── Dockerfile
+├── LICENSE
+├── README.md
+├── pyproject.toml
+└── ruff.toml
+```
+
 ### Thanks to all the contributors !
 
 ## News
