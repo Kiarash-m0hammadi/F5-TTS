@@ -26,9 +26,8 @@
 import json
 import os
 
-import jieba
+import rjieba
 import torch
-import torch.nn.functional as F
 import torchaudio
 import triton_python_backend_utils as pb_utils
 from f5_tts_trtllm import F5TTS
@@ -67,7 +66,7 @@ def convert_char_to_pinyin(reference_target_texts_list, polyphone=True):
     for text in reference_target_texts_list:
         char_list = []
         text = text.translate(custom_trans)
-        for seg in jieba.cut(text):
+        for seg in rjieba.cut(text):
             seg_byte_len = len(bytes(seg, "UTF-8"))
             if seg_byte_len == len(seg):  # if pure alphabets and symbols
                 if char_list and seg_byte_len > 1 and char_list[-1] not in " :'\"":
@@ -99,7 +98,8 @@ def list_str_to_idx(
     padding_value=-1,
 ):  # noqa: F722
     list_idx_tensors = [torch.tensor([vocab_char_map.get(c, 0) for c in t]) for t in text]  # pinyin or char style
-    return list_idx_tensors
+    text = pad_sequence(list_idx_tensors, padding_value=padding_value, batch_first=True)
+    return text
 
 
 class TritonPythonModel:
@@ -107,13 +107,12 @@ class TritonPythonModel:
         self.use_perf = True
         self.device = torch.device("cuda")
         self.target_audio_sample_rate = 24000
-        self.target_rms = 0.15  # target rms for audio
+        self.target_rms = 0.1  # least rms when inference, normalize to if lower
         self.n_fft = 1024
         self.win_length = 1024
         self.hop_length = 256
         self.n_mel_channels = 100
-        self.max_mel_len = 3000
-        self.head_dim = 64
+        self.max_mel_len = 4096
 
         parameters = json.loads(args["model_config"])["parameters"]
         for key, value in parameters.items():
@@ -181,7 +180,8 @@ class TritonPythonModel:
             reference_target_texts_list,
             estimated_reference_target_mel_len,
             reference_mel_len,
-        ) = [], [], [], [], []
+            reference_rms_list,
+        ) = [], [], [], [], [], []
         mel_features_list = []
         if self.use_perf:
             torch.cuda.nvtx.range_push("preprocess")
@@ -208,6 +208,7 @@ class TritonPythonModel:
             ref_rms = torch.sqrt(torch.mean(torch.square(wav)))
             if ref_rms < self.target_rms:
                 wav = wav * self.target_rms / ref_rms
+            reference_rms_list.append(ref_rms)
             if self.reference_sample_rate != self.target_audio_sample_rate:
                 wav = self.resampler(wav)
             wav = wav.to(self.device)
@@ -228,7 +229,7 @@ class TritonPythonModel:
         max_seq_len = min(max(estimated_reference_target_mel_len), self.max_mel_len)
 
         batch = len(requests)
-        mel_features = torch.zeros((batch, max_seq_len, self.n_mel_channels), dtype=torch.float16).to(self.device)
+        mel_features = torch.zeros((batch, max_seq_len, self.n_mel_channels), dtype=torch.float32).to(self.device)
         for i, mel in enumerate(mel_features_list):
             mel_features[i, : mel.shape[1], :] = mel
 
@@ -237,15 +238,6 @@ class TritonPythonModel:
         pinyin_list = convert_char_to_pinyin(reference_target_texts_list, polyphone=True)
         text_pad_sequence = list_str_to_idx(pinyin_list, self.vocab_char_map)
 
-        for i, item in enumerate(text_pad_sequence):
-            text_pad_sequence[i] = F.pad(
-                item, (0, estimated_reference_target_mel_len[i] - len(item)), mode="constant", value=-1
-            )
-            text_pad_sequence[i] += 1  # WAR: 0 is reserved for padding token, hard coding in F5-TTS
-        text_pad_sequence = pad_sequence(text_pad_sequence, padding_value=-1, batch_first=True).to(self.device)
-        text_pad_sequence = F.pad(
-            text_pad_sequence, (0, max_seq_len - text_pad_sequence.shape[1]), mode="constant", value=-1
-        )
         if self.use_perf:
             torch.cuda.nvtx.range_pop()
 
@@ -262,13 +254,12 @@ class TritonPythonModel:
 
         responses = []
         for i in range(batch):
-            ref_me_len = reference_mel_len[i]
+            ref_mel_len = reference_mel_len[i]
             estimated_mel_len = estimated_reference_target_mel_len[i]
-            denoised_one_item = denoised[i, ref_me_len:estimated_mel_len, :].unsqueeze(0).transpose(1, 2)
+            denoised_one_item = denoised[i, ref_mel_len:estimated_mel_len, :].unsqueeze(0).transpose(1, 2)
             audio = self.forward_vocoder(denoised_one_item)
-            rms = torch.sqrt(torch.mean(torch.square(audio)))
-            if rms < self.target_rms:
-                audio = audio * self.target_rms / rms
+            if reference_rms_list[i] < self.target_rms:
+                audio = audio * reference_rms_list[i] / self.target_rms
 
             audio = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(audio))
             inference_response = pb_utils.InferenceResponse(output_tensors=[audio])

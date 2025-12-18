@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Manual installation of TensorRT, in case not using NVIDIA NGC:
+# https://docs.nvidia.com/deeplearning/tensorrt/latest/installing-tensorrt/installing.html#downloading-tensorrt
 TRTEXEC="/usr/src/tensorrt/bin/trtexec"
 
 ONNX_PATH=$1
@@ -28,7 +30,7 @@ MAX_BATCH_SIZE=8
 
 MIN_INPUT_LENGTH=1
 OPT_INPUT_LENGTH=1000
-MAX_INPUT_LENGTH=3000
+MAX_INPUT_LENGTH=3000  # 4096
 
 MEL_MIN_SHAPE="${MIN_BATCH_SIZE}x100x${MIN_INPUT_LENGTH}"
 MEL_OPT_SHAPE="${OPT_BATCH_SIZE}x100x${OPT_INPUT_LENGTH}"
@@ -40,4 +42,3 @@ ${TRTEXEC} \
     --maxShapes="mel:${MEL_MAX_SHAPE}" \
     --onnx=${ONNX_PATH} \
     --saveEngine=${ENGINE_PATH}
-

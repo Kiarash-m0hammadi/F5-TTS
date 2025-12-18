@@ -1,3 +1,5 @@
+# ruff: noqa: F722 F821
+
 from __future__ import annotations
 
 import os
@@ -5,7 +7,7 @@ import random
 from collections import defaultdict
 from importlib.resources import files
 
-import jieba
+import rjieba
 import torch
 from pypinyin import Style, lazy_pinyin
 from torch.nn.utils.rnn import pad_sequence
@@ -48,7 +50,7 @@ def is_package_available(package_name: str) -> bool:
 # tensor helpers
 
 
-def lens_to_mask(t: int["b"], length: int | None = None) -> bool["b n"]:  # noqa: F722 F821
+def lens_to_mask(t: int["b"], length: int | None = None) -> bool["b n"]:
     if not exists(length):
         length = t.amax()
 
@@ -56,7 +58,7 @@ def lens_to_mask(t: int["b"], length: int | None = None) -> bool["b n"]:  # noqa
     return seq[None, :] < t[:, None]
 
 
-def mask_from_start_end_indices(seq_len: int["b"], start: int["b"], end: int["b"]):  # noqa: F722 F821
+def mask_from_start_end_indices(seq_len: int["b"], start: int["b"], end: int["b"]):
     max_seq_len = seq_len.max().item()
     seq = torch.arange(max_seq_len, device=start.device).long()
     start_mask = seq[None, :] >= start[:, None]
@@ -64,7 +66,7 @@ def mask_from_start_end_indices(seq_len: int["b"], start: int["b"], end: int["b"
     return start_mask & end_mask
 
 
-def mask_from_frac_lengths(seq_len: int["b"], frac_lengths: float["b"]):  # noqa: F722 F821
+def mask_from_frac_lengths(seq_len: int["b"], frac_lengths: float["b"]):
     lengths = (frac_lengths * seq_len).long()
     max_start = seq_len - lengths
 
@@ -75,7 +77,7 @@ def mask_from_frac_lengths(seq_len: int["b"], frac_lengths: float["b"]):  # noqa
     return mask_from_start_end_indices(seq_len, start, end)
 
 
-def maybe_masked_mean(t: float["b n d"], mask: bool["b n"] = None) -> float["b d"]:  # noqa: F722
+def maybe_masked_mean(t: float["b n d"], mask: bool["b n"] = None) -> float["b d"]:
     if not exists(mask):
         return t.mean(dim=1)
 
@@ -87,7 +89,7 @@ def maybe_masked_mean(t: float["b n d"], mask: bool["b n"] = None) -> float["b d
 
 
 # simple utf-8 tokenizer, since paper went character based
-def list_str_to_tensor(text: list[str], padding_value=-1) -> int["b nt"]:  # noqa: F722
+def list_str_to_tensor(text: list[str], padding_value=-1) -> int["b nt"]:
     list_tensors = [torch.tensor([*bytes(t, "UTF-8")]) for t in text]  # ByT5 style
     text = pad_sequence(list_tensors, padding_value=padding_value, batch_first=True)
     return text
@@ -98,7 +100,7 @@ def list_str_to_idx(
     text: list[str] | list[list[str]],
     vocab_char_map: dict[str, int],  # {char: idx}
     padding_value=-1,
-) -> int["b nt"]:  # noqa: F722
+) -> int["b nt"]:
     list_idx_tensors = [torch.tensor([vocab_char_map.get(c, 0) for c in t]) for t in text]  # pinyin or char style
     text = pad_sequence(list_idx_tensors, padding_value=padding_value, batch_first=True)
     return text
@@ -144,10 +146,6 @@ def get_tokenizer(dataset_name, tokenizer: str = "pinyin"):
 
 
 def convert_char_to_pinyin(text_list, polyphone=True):
-    if jieba.dt.initialized is False:
-        jieba.default_logger.setLevel(50)  # CRITICAL
-        jieba.initialize()
-
     final_text_list = []
     custom_trans = str.maketrans(
         {";": ",", "“": '"', "”": '"', "‘": "'", "’": "'"}
@@ -161,7 +159,7 @@ def convert_char_to_pinyin(text_list, polyphone=True):
     for text in text_list:
         char_list = []
         text = text.translate(custom_trans)
-        for seg in jieba.cut(text):
+        for seg in rjieba.cut(text):
             seg_byte_len = len(bytes(seg, "UTF-8"))
             if seg_byte_len == len(seg):  # if pure alphabets and symbols
                 if char_list and seg_byte_len > 1 and char_list[-1] not in " :'\"":
