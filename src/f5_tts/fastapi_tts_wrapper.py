@@ -204,8 +204,9 @@ class TTSStreamingProcessor:
         self.max_chars, self.few_chars, self.min_chars = 135, 60, 30
         self.update_reference(ref_audio, ref_text)
 
-        self._warm_up()
+        # Initialize first_package before calling _warm_up
         self.first_package = True
+        self._warm_up()
 
     def _load_ema_model(self, ckpt_file: str, vocab_file: str, dtype: torch.dtype) -> torch.nn.Module:
         """Loads the exponential moving average (EMA) model."""
@@ -292,7 +293,6 @@ class TTSStreamingProcessor:
                 yield chunk_bytes
 
         logger.info("Finished yielding audio chunks.")
-
 
 # --- Helper Functions ---
 
